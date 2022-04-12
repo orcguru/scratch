@@ -1,0 +1,151 @@
+commit 0ddb22613ae441ee50f44789e6b9bdfaeaf0bd9e
+Author: Felix <wangting@gmail.com>
+Date:   Tue Apr 12 19:06:50 2022 +0800
+
+    fix enter no return bug
+
+diff --git a/annotate-code-with-trace.pl b/annotate-code-with-trace.pl
+index c725983..031f81a 100755
+--- a/annotate-code-with-trace.pl
++++ b/annotate-code-with-trace.pl
+@@ -26,6 +26,7 @@ if ($#ARGV < 0) {
+ }
+ 
+ my $logFile = $ARGV[0];
++my $noReturnFn = "$ARGV[0].parse/.event.log.funcNoReturnList";
+ my $llvmRepo = $antlrRepo;
+ my $tcMappingFile = "$llvmRepo/.ANTLRLOG-Mapping";
+ my $folderList = "$llvmRepo/llvm/lib:$llvmRepo/clang/lib";
+@@ -38,6 +39,18 @@ my %fileMapIf = ();
+ my %fileMapOut = ();
+ my %fileShowMap = ();
+ 
++if (not -e $noReturnFn) {
++  die "Error cannot find $noReturnFn... Please run parse-trace-to-event.pl first\n";
++}
++my %noRet = ();
++open FD, "< $noReturnFn" or die "Cannot open $noReturnFn for read!\n";
++while (<FD>) {
++  my $line = $_;
++  chomp($line);
++  $noRet{$line} = 1;
++}
++close FD;
++
+ my $tcMap = &InitTCMap($tcMappingFile);
+ my %ignoreMissingEnter = (
+ "Job.cpp:::CC1Command::Execute" => 1,
+@@ -348,6 +361,9 @@ while (<FD>) {
+       die "funcname not identified!\n";
+     }
+     if ($type eq "enter") {
++      if (exists $noRet{$funcName}) {
++        next;
++      }
+       # Update NEXT info
+       if ($latestFN ne "") {
+         if (not exists $trace{$latestFN}) {
+@@ -527,19 +543,7 @@ while (<FD>) {
+       pop @runningPos;
+       pop @runningFile;
+       if ($stack != $stackDepth) {
+-        if (($stack + 1) == $stackDepth) {
+-          if ($#runningStack >= 0 and $funcName eq $runningStack[$#runningStack]->{'FUNC_NAME'}) {
+-            #print "WARNING: missing $realStack->{'FUNC_NAME'}\n";
+-            $funcName = $realStack->{'FUNC_NAME'};
+-            pop @runningStack;
+-            pop @runningFN;
+-            pop @runningPos;
+-            pop @runningFile;
+-            $stackDepth = $stackDepth - 1;
+-          } else {
+-            die "Mismatch on $funcName, expect $funcName found $realStack->{'FUNC_NAME'} $stack $stackDepth\n";
+-          }
+-        }
++        die "Mismatch on $funcName, expect $funcName found $realStack->{'FUNC_NAME'} stack:$stack stackDepth:$stackDepth\n";
+       }
+       $stackDepth = $stackDepth - 1;
+ 
+diff --git a/parse-trace-to-event.pl b/parse-trace-to-event.pl
+index a045a33..91e846a 100755
+--- a/parse-trace-to-event.pl
++++ b/parse-trace-to-event.pl
+@@ -102,6 +102,7 @@ my %funcDef = ();
+ my $lineCnt = 0;
+ my $lastRate = 0;
+ my %checkReturnSDValue = ();
++my @enterNoReturn = ();
+ open FD, "< $traceLog" or die "Cannot open $traceLog for read!\n";
+ while (<FD>) {
+   my $line = $_;
+@@ -388,21 +389,20 @@ while (<FD>) {
+         die "Missing $funcName enter2!\n";
+       }
+       my $stack = pop @{$funcStack{$funcName}};
+-      my $realStack = pop @runningStack;
+-      pop @runningFN;
+       if ($stack != $stackDepth) {
+-        if (($stack + 1) == $stackDepth) {
+-          if ($#runningStack >= 0 and $funcName eq $runningStack[$#runningStack]) {
+-            #print "WARNING: missing $realStack\n";
+-            &PrettyPrint($realStack, "return", 0, 0);
++        if ($stackDepth > $stack) {
++          while ($stackDepth > $stack) {
++            push @enterNoReturn, $runningStack[$#runningStack];
+             pop @runningStack;
+             pop @runningFN;
+             $stackDepth = $stackDepth - 1;
+-          } else {
+-            die "Mismatch on $funcName, expect $funcName found $realStack $stack $stackDepth\n";
+           }
++        } else {
++          die "Stack underflow: stack:$stack stackDepth:$stackDepth\n";
+         }
+       }
++      my $realStack = pop @runningStack;
++      pop @runningFN;
+       $stackDepth = $stackDepth - 1;
+       if ($skipReturn == 0) {
+         &PrettyPrint($funcDef{$fn}->{'RAW_FUNC'}->{$funcDef{$fn}->{'ARRAY_FUNC'}->[$returnIndex]}->{'NAME'}, $type, 0, $returnPos);
+@@ -428,6 +428,41 @@ close FD;
+ close $outEventFD;
+ close $outFlameFD;
+ 
++# Need fixup stack: attach missing return
++my $idx = 0;
++if (@enterNoReturn > 0) {
++  `cp $outFolder/event.log $outFolder/event.log.tmp`;
++  open IN, "< $outFolder/event.log.tmp" or die "Cannot open $outFolder/event.log.tmp for read!\n";
++  open OUT, "> $outFolder/event.log" or die "Cannot open $outFolder/event.log for write!\n";
++  my $target = $enterNoReturn[$idx];
++  $idx = $idx + 1;
++  while (<IN>) {
++    my $line = $_;
++    chomp($line);
++    if ($target ne "" and $line =~ /$target\senter/) {
++      print OUT "$line\n";
++      print OUT "$target return0\n";
++      if ($idx <= $#enterNoReturn) {
++        $target = $enterNoReturn[$idx];
++        $idx = $idx + 1;
++      } else {
++        $target = "";
++      }
++    } else {
++      print OUT "$line\n";
++    }
++  }
++  close IN;
++  close OUT;
++  `rm -f $outFolder/event.log.tmp`;
++}
++
++open OUT, "> $outFolder/.event.log.funcNoReturnList" or die "Cannot open $outFolder/.event.log.funcNoReturnList for write!\n";
++foreach my $k (@enterNoReturn) {
++  print OUT "$k\n";
++}
++close OUT;
++
+ foreach my $k (keys %checkReturnSDValue) {
+   open FDIN, "< $k" or die "Cannot open $k for read!\n";
+   my $curIdx = 0;
